@@ -1,13 +1,15 @@
-use std::{process::{Command, Stdio}, path::{Path, PathBuf}, fs::{self, OpenOptions, File}, io::{Write, Read}};
+use std::{process::{Command, Stdio}, path::{Path, PathBuf}, fs::{self, OpenOptions, File}, io::{Write, Read}, collections::HashMap};
 use anyhow::{Context, Result, anyhow};
+use clap::Parser;
 
 pub struct LitFile {
     testdir: PathBuf,
     litcmd: LitCmd,
+    debug: bool,
 }
 
 impl LitFile {
-    pub fn new<P: AsRef<Path>>(input: P) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(input: P, defines: Option<HashMap<String, String>>, debug: bool) -> Result<Self> {
         let input = input.as_ref();
 
         let input = input.canonicalize()
@@ -29,7 +31,16 @@ impl LitFile {
             .extension().context("failed to get input extension")?
             .to_str().context("input extension contains non-utf8 character")?
             .to_owned());
-        let litcfg = litcfg.replace("__LFVAR_SUFFIX__", &input_suffix);
+        let code = format!(r#"config.suffixes = ["{}"]"#, &input_suffix);
+        let litcfg = litcfg.replace("### __LITFILE_SUFFIX__", &code);
+
+        let mut code = vec![];
+        if let Some(defines) = defines {
+            for (k, v) in defines {
+                code.push(format!(r#"config.substitutions.append(("%{}", "{}"))"#, k, v));
+            }
+        }
+        let litcfg = litcfg.replace("### __LITFILE_SUBSTITUTIONS__", &code.join("\n"));
 
         let mut f = OpenOptions::new()
             .create(true)
@@ -47,7 +58,7 @@ impl LitFile {
             .open(testdir.join(input_name))?;
         f.write_all(content.as_bytes())?;
 
-        Ok(LitFile { testdir, litcmd: LitCmd::new()? })
+        Ok(LitFile { testdir, litcmd: LitCmd::new()?, debug })
     }
 
     pub fn run(&self) -> Result<()> {
@@ -63,11 +74,15 @@ impl LitFile {
 impl Drop for LitFile {
     fn drop(&mut self) {
         if self.testdir.exists() {
-            if let Err(e) = fs::remove_dir_all(&self.testdir) {
-                println!(
-                    "failed to remove temporary directory {} with error {e:?}",
-                    self.testdir.display()
-                );
+            if !self.debug {
+                if let Err(e) = fs::remove_dir_all(&self.testdir) {
+                    println!(
+                        "failed to remove temporary directory {} with error {e:?}",
+                        self.testdir.display()
+                    );
+                }
+            } else {
+                println!("debug files can be found at: {}", self.testdir.display());
             }
         }
     }
@@ -102,8 +117,16 @@ impl LitCmd {
 
     pub fn run<P: AsRef<Path>>(&self, testdir: P) -> Result<()> {
         let testdir = testdir.as_ref();
+        let options = {
+            if let Ok(val) = std::env::var("LIT_OPTIONS") {
+                val
+            } else {
+                "".to_owned()
+            }
+        };
         let mut litcmd = Command::new(&self.cmdpath)
             .args(["-sv", &format!("{}", testdir.display())])
+            .args(&shlex::split(&options).context(format!("failed to parse LIT_OPTIONS: {options}"))?)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
@@ -116,15 +139,47 @@ impl LitCmd {
     }
 }
 
-fn app() -> Result<()> {
-    let mut args = std::env::args();
-    let input = if let Some(input) = args.nth(1) {
-        input
-    } else {
-        return Err(anyhow!("no input file"));
-    };
+#[derive(Parser)]
+#[clap(verbatim_doc_comment)]
+#[command(version)]
+/// litfile - run llvm lit on single file
+///
+/// To pass extra options to lit, you can use environment LIT_OPTIONS, for example
+///
+///     LIT_OPTIONS="-o output.log" litfile /path/to/test.cpp
+///
+pub struct Cli {
+    /// The file to test
+    file: PathBuf,
+    /// Provide in <KEY>=<VALUE> format such as "-D CLANG=/path/to/clang", you can repeat this
+    /// option many times
+    #[arg(short = 'D', value_name = "LIT_VARIABLE")]
+    defines: Option<Vec<String>>,
+    /// Keep generated lit files
+    #[arg(long)]
+    debug: bool,
+}
 
-    let litfile = LitFile::new(input)?;
+fn app() -> Result<()> {
+    let cli = Cli::parse();
+    let input = cli.file;
+    let defines = if let Some(defines) = cli.defines {
+        let mut mp = HashMap::new();
+        for entry in defines {
+            let kvs = entry.split("=").collect::<Vec<&str>>();
+            if let (Some(k), Some(v)) = (kvs.get(0), kvs.get(1)) {
+                mp.insert(k.trim().to_owned(), v.trim().to_owned());
+            }
+        }
+        if mp.len() > 0 {
+            Some(mp)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let litfile = LitFile::new(input, defines, cli.debug)?;
     litfile.info()?;
     litfile.run()
 }

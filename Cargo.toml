@@ -1,10 +1,12 @@
 [package]
 name = "litfile"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 anyhow = "1.0.71"
+clap = { version = "4.2.7", features = ["derive"] }
+shlex = "1.1.0"
 which = "4.4.0"
 
 [profile.release]
